@@ -1,0 +1,138 @@
+function exp4_calibrated_pvalues(mode)
+%EXP4_CALIBRATED_PVALUES  Simulation-calibrated p-values (Sec. 3.3.3).
+%
+%   exp4_calibrated_pvalues('real')
+%
+%   For every real comparison of exp3, 500 null replicates reproduce its
+%   design (number of subjects, location on the axis, visit pattern,
+%   common quadratic curve, between- and within-subject SDs) and the
+%   transition-age error of its cohort and transition (Table 1). The
+%   statistic T of each replicate gives the null distribution, and
+%       p_cal = (1 + #{T_null >= T_obs}) / (1 + R).
+%
+%   Paper items (check numbers against the final PDF):
+%     Table 4   p and p_cal of the 24 comparisons   table_p_pcal.tex / .csv
+%     Fig. 3    type I error and p vs. p_cal        fig_sim_cal.png (plot_sim_cal)
+%     Table S9  full calibrated simulation          sim_out_<C>/sim_calibrated.tex
+%
+%   Needs exp3 (calib_<C>.csv, bw_sensitivity_<C>[_ll].csv) and, when
+%   config.TAU_SOURCE = 'computed', exp2 (tau_error_table.csv).
+%   Outputs: results/<mode>/exp4_calibrated_pvalues/
+%
+%   Authorship: Carlos Platero (UPM), with the collaboration of Claude
+%   (Anthropic).
+
+if nargin < 1, mode = 'real'; end
+C = config(mode);
+in  = fullfile(C.resultsDir, 'exp3_bandwidth');
+out = fullfile(C.resultsDir, 'exp4_calibrated_pvalues');
+if ~exist(out, 'dir'), mkdir(out); end
+tauTable = get_tau_table(C);
+
+for c = 1:numel(C.cohorts)
+    co = C.cohorts{c};
+    calib = fullfile(in, sprintf('calib_%s.csv', co));
+    obs = {fullfile(in, sprintf('bw_sensitivity_%s.csv', co)), ...
+           fullfile(in, sprintf('bw_sensitivity_%s_ll.csv', co))};
+    need = [{calib}, obs];
+    for k = 1:numel(need)
+        if ~exist(need{k}, 'file')
+            error('exp4:input', 'Missing %s. Run exp3_bandwidth(''%s'') first.', need{k}, mode);
+        end
+    end
+    sim_framework('design', 'calibrated', 'calibFiles', {calib}, 'obsFiles', obs, ...
+        'tauTable', tauTable, 'nRepsCal', C.N_REPS_CAL, 'nPerm', C.N_PERM_CAL, ...
+        'bw', C.BW, 'seed', C.SEED, 'bPlots', false, ...
+        'outDir', fullfile(out, sprintf('sim_out_%s', co)));
+end
+write_p_pcal_table(C, in, out);
+
+% Fig. 3: type I error of each comparison and p against p_cal
+simF = cellfun(@(co) fullfile(out, sprintf('sim_out_%s', co), 'sim_results.csv'), C.cohorts, 'UniformOutput', false);
+pF   = cellfun(@(co) fullfile(in, sprintf('bw_sensitivity_%s_ll.csv', co)), C.cohorts, 'UniformOutput', false);
+plot_sim_cal('simFiles', simF, 'pFiles', pF, 'bw', C.BW, 'outFile', fullfile(out, 'fig_sim_cal.png'));
+end
+
+
+function tauTable = get_tau_table(C)
+% Transition-age error used by the calibrated simulation.
+if strcmp(C.TAU_SOURCE, 'paper')
+    tauTable = C.TAU_PAPER;
+    fprintf('[exp4] Transition-age error: published values (Table 1).\n');
+    return
+end
+f = fullfile(C.resultsDir, 'exp2_transition_age_error', 'tau_error_table.csv');
+if ~exist(f, 'file')
+    error('exp4:tau', 'Missing %s. Run exp2_transition_age_error first.', f);
+end
+T = readtable(f, 'TextType', 'string');
+tauTable = struct('cohort', cellstr(T.cohort)', 'transition', cellstr(T.transition)', ...
+                  'core', num2cell(T.core)', 'tail', num2cell(T.tail)', 'pTail', num2cell(T.pTail)');
+fprintf('[exp4] Transition-age error: values computed by exp2 (%s).\n', f);
+end
+
+
+function write_p_pcal_table(C, in, out)
+% Table 4: one row per cohort, transition, stratification and marker.
+% p from bw_sensitivity (local-linear, bw = C.BW); p_cal and the type I
+% error of the calibration from sim_framework (estimator swll_bw<C.BW>).
+est = sprintf('swll_bw%g', C.BW);
+rows = {};
+for c = 1:numel(C.cohorts)
+    co = C.cohorts{c};
+    P = readtable(fullfile(in, sprintf('bw_sensitivity_%s_ll.csv', co)), 'TextType', 'string');
+    P = P(abs(P.bw - C.BW) < 1e-9, :);
+    S = readtable(fullfile(out, sprintf('sim_out_%s', co), 'sim_results.csv'), 'TextType', 'string');
+    S = S(S.estimator == est, :);
+    P = P(ismember(P.analysis, {'A', 'V'}), :);              % Table 4: A and V only
+    for k = 1:height(P)
+        key = sprintf('%s|%s|%s|%s', co, P.transition(k), P.analysis(k), P.var(k));
+        m = find(S.scenario == key, 1);
+        pcal = NaN;  t1 = NaN;
+        if ~isempty(m), pcal = S.pCal(m);  t1 = S.reject(m); end
+        rows(end+1, :) = {co, char(P.transition(k)), char(P.analysis(k)), char(P.var(k)), ...
+            P.n0(k), P.n1(k), P.T_obs(k), P.p(k), t1, pcal}; %#ok<AGROW>
+    end
+end
+
+fid = fopen(fullfile(out, 'table_p_pcal.csv'), 'w');
+fprintf(fid, 'cohort,transition,analysis,var,n0,n1,T_obs,p,typeI_cal,p_cal,robust\n');
+for k = 1:size(rows, 1)
+    r = rows(k, :);
+    fprintf(fid, '%s,%s,%s,%s,%d,%d,%.6f,%.6f,%.4f,%.6f,%d\n', r{1:4}, r{5:10}, ...
+        r{8} < 0.05 && r{10} < 0.05);
+end
+fclose(fid);
+
+lab = containers.Map({'MEM', 'EF', 'WMH', 'CENTILOIDS'}, {'MEM', 'EF', 'WMH', 'Centiloids'});
+fid = fopen(fullfile(out, 'table_p_pcal.tex'), 'w');
+fprintf(fid, '%% Auto-generated by exp4_calibrated_pvalues.m\n\\begin{table}[htbp]\n\\centering\n');
+fprintf(fid, ['\\caption{Comparison of subgroup trajectories on the disease-time axis ' ...
+    '(local-linear \\textit{sw}-LOESS, $bw=%g$~years). $n_0$, $n_1$: subjects in each subgroup. ' ...
+    '$T_{\\rm obs}$: mean absolute difference between the two curves on their common range. ' ...
+    '$p$: subject-level permutation test (%d permutations). Type~I: rejection rate of the permutation ' ...
+    'test in the calibrated null replicates. $p_{\\rm cal}$: simulation-calibrated $p$-value (%d replicates). ' ...
+    'Bold: $p<0.05$ and $p_{\\rm cal}<0.05$.}\n\\label{tab:p_pcal}\n\\scriptsize\n'], C.BW, C.N_PERM, C.N_REPS_CAL);
+fprintf(fid, '\\begin{tabular}{@{}lllrrrrrr@{}}\n\\toprule\n');
+fprintf(fid, 'Transition & Comparison & Marker & $n_0$ & $n_1$ & $T_{\\rm obs}$ & $p$ & Type~I & $p_{\\rm cal}$ \\\\\n');
+prev = '';
+for k = 1:size(rows, 1)
+    r = rows(k, :);
+    if ~strcmp(prev, r{1})
+        fprintf(fid, '\\midrule\n\\multicolumn{9}{@{}l}{\\textbf{%s}} \\\\\n', r{1});
+        prev = r{1};
+    end
+    cmp = strrep(strrep(r{3}, 'A', 'A$+$ vs.\ A$-$'), 'V', 'V$+$ vs.\ V$-$');
+    fp = fmt3(r{8});  fc = fmt3(r{10});
+    if r{8} < 0.05 && r{10} < 0.05, fp = ['\textbf{' fp '}']; fc = ['\textbf{' fc '}']; end
+    fprintf(fid, '%s & %s & %s & %d & %d & %.3f & %s & %.2f & %s \\\\\n', ...
+        strrep(r{2}, '2', '$\to$'), cmp, lab(r{4}), r{5}, r{6}, r{7}, fp, r{9}, fc);
+end
+fprintf(fid, '\\bottomrule\n\\end{tabular}\n\\end{table}\n');
+fclose(fid);
+fprintf('[exp4] Table of p and p_cal: %s\n', fullfile(out, 'table_p_pcal.tex'));
+end
+
+function s = fmt3(p)
+if isnan(p), s = 'n.e.'; elseif p < 0.001, s = '$<$0.001'; else, s = sprintf('%.3f', p); end
+end
